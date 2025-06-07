@@ -1,497 +1,1019 @@
 #include <Wire.h>
 #include "src/U8glib/U8glib.h"
-U8GLIB_SH1106_128X64 u8g(U8G_I2C_OPT_NONE);    // I2C
-#include "Wire.h"
 #include "src/RTClib/src/RTClib.h"
+#include <EEPROM.h>
+// EEPROM configuration
+#define EEPROM_MAGIC 0xABCD  // Magic number to verify valid data
+#define EEPROM_START_ADDR 0
+#define EEPROM_MAGIC_ADDR EEPROM_START_ADDR
+#define EEPROM_PROGRAMS_ADDR (EEPROM_START_ADDR + 2)
+
+// Display setup
+U8GLIB_SH1106_128X64 u8g(U8G_I2C_OPT_NONE);    // I2C
+
+// RTC setup
 RTC_DS1307 RTC;
 
-// set all moisture sensors PIN ID
-int moisture1 = A0;
-int moisture2 = A1;
-int moisture3 = A2;
-int moisture4 = A3;
+// Pin definitions
+#define NUM_CHANNELS 4
+#define PUMP_PIN 4
 
-// declare moisture values
-int moisture1_value = 0 ;
-int moisture2_value = 0;
-int moisture3_value = 0;
-int moisture4_value = 0;
+// Encoder pins and interrupt
+#define ENC_INT PE6  // INT6 for all inputs detection
+#define ENC_A MISO   // Encoder A signal
+#define ENC_B MOSI   // Encoder B signal
+#define ENC_BTN SCK  // Encoder button
 
-// set water relays
-int relay1 = 6;
-int relay2 = 8;
-int relay3 = 9;
-int relay4 = 10;
+// Direct port reading bits
+#define ENC_A_BIT  3  // MISO is PB3
+#define ENC_B_BIT  2  // MOSI is PB2
+#define ENC_BTN_BIT 1 // SCK is PB1
+#define readEncoderA() (!!(PINB & (1 << ENC_A_BIT)))
+#define readEncoderB() (!!(PINB & (1 << ENC_B_BIT)))
+#define readEncoderButton() (!!(PINB & (1 << ENC_BTN_BIT)))
 
-// set water pump
-int pump = 4;
+// Timing constants
+const unsigned long LONG_PRESS_TIME = 1000;     // 1 second for long press
+const unsigned long DEBOUNCE_TIME = 50;         // Button debounce
+const unsigned long INTERRUPT_DEBOUNCE = 5000;  // Encoder interrupt debounce
 
-// set button
-int button = 12;
+// Channel configuration
+const uint8_t CHANNEL_PINS[NUM_CHANNELS] = {6, 8, 9, 10}; // relay1-4 pins
+bool channelStates[NUM_CHANNELS] = {false};
+bool pumpState = false;
 
-//pump state    1:open   0:close
-int pump_state_flag = 0;
+// Days of week
+const char* daysOfTheWeek[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
 
-//relay1 state    1:open   0:close
-int relay1_state_flag = 0;
+// Programm day patterns
+uint8_t currentPattern = 0;
 
-//relay2 state   1:open   0:close
-int relay2_state_flag = 0;
+// Day patterns definition
+struct DayPattern {
+  const bool days[7];
+  const char* name;
+};
+const DayPattern PATTERNS[] PROGMEM = {
+  {{1, 1, 1, 1, 1, 1, 1}, "ALL"}, // Every day
+  {{1, 0, 0, 0, 0, 0, 0}, "MON"}, // Monday only
+  {{0, 1, 0, 0, 0, 0, 0}, "TUE"}, // Tuesday only
+  {{0, 0, 1, 0, 0, 0, 0}, "WED"}, // Wednesday only
+  {{0, 0, 0, 1, 0, 0, 0}, "THU"}, // Thursday only
+  {{0, 0, 0, 0, 1, 0, 0}, "FRI"}, // Friday only
+  {{0, 0, 0, 0, 0, 1, 0}, "SAT"}, // Saturday only
+  {{0, 0, 0, 0, 0, 0, 1}, "SUN"}, // Sunday only
+  {{1, 1, 1, 1, 1, 0, 0}, "WORK"}, // Weekdays
+  {{0, 0, 0, 0, 0, 1, 1}, "WEEK"}, // Weekend
+  {{1, 0, 1, 0, 1, 0, 0}, "ODD"}, // Odd days
+  {{0, 1, 0, 1, 0, 1, 0}, "EVEN"}, // Even days
+};
+const uint8_t NUM_PATTERNS = sizeof(PATTERNS) / sizeof(PATTERNS[0]);
+const char* dayPatternName = "ALL";  // Default pattern name
 
-//relay3 state  1:open   0:close
-int relay3_state_flag = 0;
+// Volatile state variables
+volatile int encoderValue = 0;
+volatile int lastEncoderValue = 0;
+volatile uint8_t lastA = HIGH;
+volatile uint8_t lastB = HIGH;
+volatile int8_t stepCount = 0;
+volatile bool stepReady = false;
+volatile unsigned long lastInterruptTime = 0;
+volatile unsigned long lastButtonTime = 0;
+bool buttonState = HIGH;
+bool lastButtonState = HIGH;
 
-//relay4 state   1:open   0:close
-int relay4_state_flag = 0;
-
-static unsigned long currentMillis_send = 0;
-static unsigned long  Lasttime_send = 0;
-
-char daysOfTheWeek[7][4] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-unsigned long nowtime;
-unsigned long endtime;
-unsigned long nowtimeNext;
-unsigned long nowtime1;
-unsigned long endtime1;
-unsigned long nowtimeNext1;
-unsigned long nowtime2;
-unsigned long endtime2;
-unsigned long nowtimeNext2;
-unsigned long nowtime3;
-unsigned long endtime3;
-unsigned long nowtimeNext3;
-
-
-// good flower
-unsigned char bitmap_good[] U8G_PROGMEM = {
-
-  0x00, 0x42, 0x4C, 0x00, 0x00, 0xE6, 0x6E, 0x00, 0x00, 0xAE, 0x7B, 0x00, 0x00, 0x3A, 0x51, 0x00,
-  0x00, 0x12, 0x40, 0x00, 0x00, 0x02, 0x40, 0x00, 0x00, 0x06, 0x40, 0x00, 0x00, 0x06, 0x40, 0x00,
-  0x00, 0x04, 0x60, 0x00, 0x00, 0x0C, 0x20, 0x00, 0x00, 0x08, 0x30, 0x00, 0x00, 0x18, 0x18, 0x00,
-  0x00, 0xE0, 0x0F, 0x00, 0x00, 0x80, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
-  0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x02, 0xC1, 0x00, 0x00, 0x0E, 0x61, 0x00,
-  0x00, 0x1C, 0x79, 0x00, 0x00, 0x34, 0x29, 0x00, 0x00, 0x28, 0x35, 0x00, 0x00, 0x48, 0x17, 0x00,
-  0x00, 0xD8, 0x1B, 0x00, 0x00, 0x90, 0x1B, 0x00, 0x00, 0xB0, 0x09, 0x00, 0x00, 0xA0, 0x05, 0x00,
-  0x00, 0xE0, 0x07, 0x00, 0x00, 0xC0, 0x03, 0x00
+// Screen field enums
+enum HomeFields { HOME_NONE = 0 };
+enum ConfigFields {
+  PROG_NUMBER = 0,
+  PROG_ACTIVE,
+  PROG_START,
+  PROG_DAYS,
+  PROG_DURATION,
+  PROG_CHANNELS,
+  PROG_FIELDS_COUNT
+};
+enum ClockFields {
+  CLOCK_YEAR = 0,
+  CLOCK_MONTH,
+  CLOCK_DAY,
+  CLOCK_HOUR,
+  CLOCK_MIN,
+  CLOCK_SEC
 };
 
-// bad flower
-unsigned char bitmap_bad[] U8G_PROGMEM = {
-  0x00, 0x80, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0xE0, 0x0D, 0x00, 0x00, 0xA0, 0x0F, 0x00,
-  0x00, 0x20, 0x69, 0x00, 0x00, 0x10, 0x78, 0x02, 0x00, 0x10, 0xC0, 0x03, 0x00, 0x10, 0xC0, 0x03,
-  0x00, 0x10, 0x00, 0x01, 0x00, 0x10, 0x80, 0x00, 0x00, 0x10, 0xC0, 0x00, 0x00, 0x30, 0x60, 0x00,
-  0x00, 0x60, 0x30, 0x00, 0x00, 0xC0, 0x1F, 0x00, 0x00, 0x60, 0x07, 0x00, 0x00, 0x60, 0x00, 0x00,
-  0x00, 0x60, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
-  0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0xC7, 0x1C, 0x00,
-  0x80, 0x68, 0x66, 0x00, 0xC0, 0x33, 0x7B, 0x00, 0x40, 0xB6, 0x4D, 0x00, 0x00, 0xE8, 0x06, 0x00,
-  0x00, 0xF0, 0x03, 0x00, 0x00, 0xE0, 0x00, 0x00
+// Program settings structure
+struct Program {
+  uint8_t number;     // 1-9
+  uint8_t hour;       // 0-23
+  uint8_t minute;     // 0-59
+  uint8_t duration;   // seconds
+  bool days[7];       // M T W T F S S
+  bool channels[4];   // 1 2 3 4
+  bool active;        // Whether this program is enabled
+};
+// Array of programs
+#define MAX_PROGRAMS 9
+Program programs[MAX_PROGRAMS];
+
+// Screen states structure
+struct ScreenState {
+  uint8_t screen;    // 0:home, 1:config, 2:clock
+  uint8_t field;     // Currently selected field
+  uint8_t currentProgram;  // Index of program being edited
 };
 
-// Elecrow Logo
-static unsigned char bitmap_logo[] U8G_PROGMEM = {
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0xE0, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x04, 0xF8, 0xFF, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x08, 0xFE, 0xFF, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x10, 0x1F, 0xE0, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0xB0, 0x07, 0x80, 0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0xE0, 0x03, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0xC0, 0x00, 0x00, 0x3E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x80, 0x01, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x60, 0x23, 0x00, 0x7C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x70, 0xC7, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x70, 0x9E, 0x0F, 0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x70, 0x3C, 0xFE, 0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x70, 0x78, 0xF8, 0x7F, 0xF0, 0x9F, 0x07, 0xFE, 0x83, 0x0F, 0xFF, 0x00, 0x77, 0x3C, 0x18, 0x1C,
-  0x70, 0xF0, 0xE1, 0x3F, 0xF1, 0x9F, 0x07, 0xFE, 0xE1, 0x1F, 0xFF, 0xC3, 0xF7, 0x3C, 0x38, 0x0C,
-  0x70, 0xE0, 0x87, 0x8F, 0xF1, 0xC0, 0x07, 0x1E, 0x70, 0x3C, 0xCF, 0xE3, 0xE1, 0x7D, 0x3C, 0x0E,
-  0x70, 0xD0, 0x1F, 0xC0, 0xF1, 0xC0, 0x03, 0x1F, 0x78, 0x3C, 0xCF, 0xE3, 0xE1, 0x7D, 0x3C, 0x06,
-  0xF0, 0xB0, 0xFF, 0xF1, 0xF0, 0xC0, 0x03, 0x0F, 0x78, 0x3C, 0xCF, 0xF3, 0xE0, 0x7B, 0x3E, 0x06,
-  0xF0, 0x60, 0xFF, 0xFF, 0xF0, 0xC6, 0x03, 0xEF, 0x3C, 0x80, 0xEF, 0xF1, 0xE0, 0x7B, 0x3E, 0x03,
-  0xF0, 0xE1, 0xFC, 0xFF, 0xF8, 0xCF, 0x03, 0xFF, 0x3C, 0x80, 0xFF, 0xF0, 0xE0, 0x7B, 0x7B, 0x01,
-  0xE0, 0xC3, 0xF9, 0x7F, 0x78, 0xC0, 0x03, 0x0F, 0x3C, 0x80, 0xF7, 0xF1, 0xE0, 0xF9, 0xF9, 0x01,
-  0xE0, 0x83, 0xE3, 0x7F, 0x78, 0xE0, 0x03, 0x0F, 0x3C, 0xBC, 0xE7, 0xF1, 0xE0, 0xF9, 0xF9, 0x00,
-  0xC0, 0x0F, 0x8F, 0x3F, 0x78, 0xE0, 0x81, 0x0F, 0x3C, 0x9E, 0xE7, 0xF1, 0xE0, 0xF1, 0xF8, 0x00,
-  0x80, 0x3F, 0x1E, 0x00, 0x78, 0xE0, 0x81, 0x07, 0x38, 0x9E, 0xE7, 0xF1, 0xF0, 0xF0, 0x78, 0x00,
-  0x80, 0xFF, 0xFF, 0x00, 0xF8, 0xEF, 0xBF, 0xFF, 0xF8, 0xCF, 0xE7, 0xE1, 0x7F, 0x70, 0x70, 0x00,
-  0x00, 0xFF, 0xFF, 0x0F, 0xF8, 0xEF, 0xBF, 0xFF, 0xE0, 0xC3, 0xE3, 0x81, 0x1F, 0x70, 0x30, 0x00,
-  0x00, 0xFC, 0xFF, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0xF8, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0xE0, 0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+// Global state
+ScreenState state = {
+  0,    // Start at home screen
+  0,    // No field selected
+  0     // Start with first program
 };
+uint8_t daySelector = 0;  // Current day being selected
+uint8_t channelSelector = 0;  // Current channel being selected
+uint8_t channelBits = 0;  // Binary representation of channels (0000-1111)
 
 
-static unsigned char bitmap_T[] U8G_PROGMEM = {
-  0xF7, 0x01, 0x1D, 0x03, 0x0B, 0x02, 0x0C, 0x02, 0x0C, 0x00, 0x0C, 0x00, 0x0C, 0x00, 0x08, 0x02,
-  0x18, 0x03, 0xF0, 0x01
+struct ScreenManager {
+  unsigned long lastUserInteraction = 0;
+  const unsigned long SCREEN_TIMEOUT = 30000;  // 30 seconds
+  const unsigned long DIM_TIMEOUT = 15000;     // 15 seconds to dim
+  bool screenOn = true;
+  bool screenDimmed = false;
+  uint8_t normalContrast = 255;
+  uint8_t dimContrast = 32;
+
+  void setContrast(uint8_t contrast) {
+    Wire.beginTransmission(0x3C);
+    Wire.write(0x00);
+    Wire.write(0x81);
+    Wire.write(contrast);
+    Wire.endTransmission();
+  }
+
+  void turnOff() {
+    Wire.beginTransmission(0x3C);
+    Wire.write(0x00);
+    Wire.write(0xAE);  // Display OFF
+    Wire.endTransmission();
+  }
+
+  void turnOn() {
+    Wire.beginTransmission(0x3C);
+    Wire.write(0x00);
+    Wire.write(0xAF);  // Display ON
+    Wire.endTransmission();
+  }
+
+  void checkPower() {
+    unsigned long timeSinceInteraction = millis() - lastUserInteraction;
+
+    if (screenOn && timeSinceInteraction > SCREEN_TIMEOUT) {
+      screenOn = false;
+      screenDimmed = false;
+      turnOff();
+      Serial.println("Screen OFF");
+    } else if (screenOn && !screenDimmed && timeSinceInteraction > DIM_TIMEOUT) {
+      screenDimmed = true;
+      setContrast(dimContrast);
+      Serial.println("Screen DIMMED");
+    }
+  }
+
+  void wake() {
+    if (!screenOn) {
+      screenOn = true;
+      screenDimmed = false;
+      turnOn();
+      setContrast(normalContrast);
+      Serial.println("Screen ON");
+    } else if (screenDimmed) {
+      screenDimmed = false;
+      setContrast(normalContrast);
+      Serial.println("Screen BRIGHT");
+    }
+    lastUserInteraction = millis();
+  }
 };
+ScreenManager screen;
 
-static unsigned char bitmap_H[] U8G_PROGMEM = {
-  0x00, 0x00, 0x80, 0x01, 0xC0, 0x03, 0xE0, 0x07, 0xF0, 0x0F, 0xF8, 0x1F, 0xF8, 0x1F, 0xFC, 0x3F,
-  0xFC, 0x3F, 0xFE, 0x7F, 0xEE, 0x7F, 0xB3, 0xF7, 0xBB, 0xFB, 0xBB, 0xFD, 0xBB, 0xFD, 0xC7, 0xFE,
-  0x7F, 0xC3, 0x3F, 0xDD, 0xBF, 0xFD, 0xDF, 0xDD, 0xEE, 0x5B, 0xFE, 0x7F, 0xFC, 0x3F, 0xF8, 0x1F,
-  0xE0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-};
+// Function declarations
+void handleButtonPress(bool isPressed);
+void handleEncoderChange();
+void updateConfigValue(int change);
+void updateClockValue(int change);
+void drawHomeScreen();
+void drawConfigScreen();
+void drawClockScreen();
+void drawFieldHighlight();
+void drawClockFieldHighlight();
+void updateWateringSystem();
+void testEncoder();
+void testScreenTransitions();
 
-uint32_t currentTimeMillis = 0;
-uint32_t lastMeasureTimeMillis = 0;
-uint32_t lastSetStateTimeMillis = 0;
-uint32_t lastScreenUpdateTimeMillis = 0;
-uint16_t measureTimeIntervalMillis = 1000;
-uint16_t setStateIntervalMillis = 1000;
-uint16_t screenUpdateIntervalMillis = 1000;
-DateTime pumpOnLastDateTime;
-byte showPumpLastOnTimeOncePerScreensUpdate = 8;
-byte screenUpdateNumber = 1;
+void setup() {
+  // Initialize display first
+  u8g.begin();  // Add this line
+  u8g.setFont(u8g_font_6x10);
 
-void setup()
-{
+  // Clear display and show initial message
   u8g.firstPage();
   do {
-    draw_elecrow();
-    //    drawLogo(0);
+    u8g.drawStr(0, 10, "Initializing...");
   } while (u8g.nextPage());
 
-  delay(1000);
-
+  // Initialize communication
   Wire.begin();
   RTC.begin();
   Serial.begin(9600);
-  // declare relay as output
-  pinMode(relay1, OUTPUT);
-  pinMode(relay2, OUTPUT);
-  pinMode(relay3, OUTPUT);
-  pinMode(relay4, OUTPUT);
-  // declare pump as output
-  pinMode(pump, OUTPUT);
-  // declare switch as input
-  pinMode(button, INPUT);
-  //pinMode(ROTARY_ANGLE_SENSOR, INPUT);
 
-  if (false) {
-    Serial.println("RTC power failure, resetting the time!");
+  // Initialize encoder pins
+  pinMode(ENC_A, INPUT_PULLUP);
+  pinMode(ENC_B, INPUT_PULLUP);
+  pinMode(ENC_BTN, INPUT_PULLUP);
+  pinMode(ENC_INT, INPUT_PULLUP);
+
+  // Initialize outputs
+  pinMode(PUMP_PIN, OUTPUT);
+  for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
+    pinMode(CHANNEL_PINS[i], OUTPUT);
+    digitalWrite(CHANNEL_PINS[i], LOW);
+  }
+  digitalWrite(PUMP_PIN, LOW);
+
+  // Setup INT6 interrupt
+  EICRB &= ~(1 << ISC60);
+  EICRB |= (1 << ISC61);
+  EIMSK |= (1 << INT6);
+  sei();
+
+  // Initialize RTC if needed
+  if (!RTC.isrunning()) {
     RTC.adjust(DateTime(F(__DATE__), F(__TIME__)));
   }
+
+  // Try to load programs from EEPROM
+  if (!loadPrograms()) {
+    // If no valid data, initialize defaults and save
+    initializeDefaultPrograms();
+    savePrograms();
+  }
+
+  delay(1000);  // Show initialization message
+
+  setDisplayContrast(0);
+
+
+  // Draw home screen
+  u8g.firstPage();
+  do {
+    drawHomeScreen();
+  } while (u8g.nextPage());
 }
 
-int button_state = 0;
-void loop()
-{
-  currentTimeMillis = millis();
+void setDisplayContrast(uint8_t contrast) {
+  u8g.firstPage();
+  do {
+    // Empty page to send commands
+  } while (u8g.nextPage());
 
+  // Try direct I2C command
+  Wire.beginTransmission(0x3C);  // OLED I2C address
+  Wire.write(0x00);              // Command mode
+  Wire.write(0x81);              // Contrast command
+  Wire.write(contrast);          // Contrast value
+  Wire.endTransmission();
+}
 
-  // read the value from the moisture sensors:
-  if (currentTimeMillis - lastMeasureTimeMillis > measureTimeIntervalMillis) {
-    updateSensorMeasurements();
-    lastMeasureTimeMillis = millis();
+void loop() {
+  // Handle encoder and button
+  handleEncoderChange();
+  checkButton();
 
-    if (currentTimeMillis - lastSetStateTimeMillis > setStateIntervalMillis) {
-      computeRelayAndPumpState();
-      flushRelayAndPumpState();
-      lastSetStateTimeMillis = millis();
+  // Process encoder changes
+  if (encoderValue != lastEncoderValue) {
+    int change = encoderValue - lastEncoderValue;
+    lastEncoderValue = encoderValue;
+
+    switch (state.screen) {
+      case 1: // Config screen
+        updateConfigValue(change);
+        break;
+      case 2: // Clock screen
+        updateClockValue(change);
+        break;
     }
   }
 
-  if (currentTimeMillis - lastScreenUpdateTimeMillis > screenUpdateIntervalMillis || button_state != digitalRead(button)) {
-    button_state = digitalRead(button);
-    if (button_state == 1) {
-      if (screenUpdateNumber % showPumpLastOnTimeOncePerScreensUpdate == 0) {
-        u8g.firstPage();
-        do {
-          draw_time(pumpOnLastDateTime);
-          u8g.drawStr(0, 55 , "last time pumpON");
-        } while (u8g.nextPage());
-      } else {
-        u8g.firstPage();
-        do {
-          drawTH();
-          drawflower();
+  screen.checkPower();
+  if (screen.screenOn) {
+    // Update display
+    u8g.firstPage();
+    do {
+      switch (state.screen) {
+        case 0:
+          drawHomeScreen();
+          break;
+        case 1:
+          drawConfigScreen();
+          break;
+        case 2:
+          drawClockScreen();
+          break;
+      }
+    } while (u8g.nextPage());
+  }
 
-        } while (u8g.nextPage());
+  updateWateringSystem();
+  // Debug output
+  //testEncoder();
+  //testScreenTransitions();
+}
+
+// Interrupt handler for encoder
+ISR(INT6_vect) {
+  unsigned long interruptTime = micros();
+  if (interruptTime - lastInterruptTime > INTERRUPT_DEBOUNCE) {
+    uint8_t A = readEncoderA();
+    uint8_t B = readEncoderB();
+
+    if (A != lastA) {
+      stepCount += (B ? -1 : 1);
+      lastA = A;
+      stepReady = true;
+    }
+    if (B != lastB) {
+      stepCount += (A ? 1 : -1);
+      lastB = B;
+      stepReady = true;
+    }
+
+    lastInterruptTime = interruptTime;
+  }
+}
+
+void handleEncoderChange() {
+  if (stepReady) {
+    if (stepCount >= 2) {
+      encoderValue++;
+      stepCount = 0;
+    } else if (stepCount <= -2) {
+      encoderValue--;
+      stepCount = 0;
+    }
+    stepReady = false;
+  }
+}
+
+void checkButton() {
+  bool reading = readEncoderButton();
+  static bool pressHandled = false;
+
+  if (reading != lastButtonState) {
+    lastButtonTime = millis();
+  }
+
+  if ((millis() - lastButtonTime) > DEBOUNCE_TIME) {
+    if (reading != buttonState) {
+      buttonState = reading;
+
+      if (buttonState == 0) { // Press detected
+        handleButtonPress(true);
+        pressHandled = false;
+      } else if (!pressHandled) { // Release detected
+        handleButtonPress(false);
+        pressHandled = true;
+      }
+    }
+  }
+
+  lastButtonState = reading;
+}
+
+void handleButtonPress(bool isPressed) {
+  static unsigned long pressStartTime = 0;
+
+  screen.wake();
+  if (!screen.screenOn) return;
+
+  if (isPressed) {
+    pressStartTime = millis();
+    Serial.println("Button pressed");
+  } else {
+    unsigned long pressDuration = millis() - pressStartTime;
+    Serial.print("Button released, duration: ");
+    Serial.println(pressDuration);
+
+    if (pressDuration > LONG_PRESS_TIME) {
+      Serial.println("Long press");
+      switch (state.screen) {
+        case 0: // From Home -> Clock
+          state.screen = 2;
+          state.field = CLOCK_HOUR;
+          break;
+        case 1: // From Config -> Save and Home
+          savePrograms();  // Save programs to EEPROM
+          state.screen = 0;
+          state.field = HOME_NONE;
+          break;
+        case 2: // From Clock -> Save and Home
+          state.screen = 0;
+          state.field = HOME_NONE;
+          break;
       }
     } else {
-      u8g.firstPage();
-      do {
-        DateTime now = RTC.now();
-        draw_time(now);
-        u8g.drawStr(8, 55 , "www.elecrow.com");
-      } while (u8g.nextPage());
+      Serial.println("Short press");
+      switch (state.screen) {
+        case 0: // From Home -> Config
+          state.screen = 1;
+          state.field = PROG_NUMBER;
+          break;
+
+        case 1: // In Config screen
+          state.field = (state.field + 1) % PROG_FIELDS_COUNT;
+          break;
+
+        case 2: // In Clock - cycle fields
+          state.field = (state.field + 1) % 6;
+          break;
+      }
     }
-
-    screenUpdateNumber++;
-    lastScreenUpdateTimeMillis = millis();
   }
 }
 
-void updateSensorMeasurements()
-{
-  float value1 = analogRead(A0);
-  moisture1_value = map(value1, 590, 360, 0, 100);
-  if (moisture1_value < 0) {
-    moisture1_value = 0;
-  }
+void updateConfigValue(int change) {
+  Program& prog = programs[state.currentProgram];
 
-  float value2 = analogRead(A1);
-  moisture2_value = map(value2, 600, 360, 0, 100);
-  if (moisture2_value < 0) {
-    moisture2_value = 0;
-  }
+  switch (state.field) {
+    case PROG_NUMBER:
+      state.currentProgram = (state.currentProgram + change + MAX_PROGRAMS) % MAX_PROGRAMS;
+      break;
 
-  float value3 = analogRead(A2);
-  moisture3_value = map(value3, 600, 360, 0, 100);
-  if (moisture3_value < 0) {
-    moisture3_value = 0;
-  }
+    case PROG_ACTIVE:
+      if (change != 0) { // Toggle with encoder
+        prog.active = !prog.active;
+      }
+      break;
+    case PROG_START:
+      prog.hour = (prog.hour + change + 24) % 24;
+      prog.minute = 0;  // Always keep minutes at 0
+      break;
 
-  float value4 = analogRead(A3);
-  moisture4_value = map(value4, 600, 360, 0, 100);
-  if (moisture4_value < 0) {
-    moisture4_value = 0;
-  }
-}
+    case PROG_DAYS:
+      currentPattern = (currentPattern + change + NUM_PATTERNS) % NUM_PATTERNS;
+      for (uint8_t i = 0; i < 7; i++) {
+        prog.days[i] = pgm_read_byte(&(PATTERNS[currentPattern].days[i]));
+      }
+      dayPatternName = (const char*)pgm_read_ptr(&(PATTERNS[currentPattern].name));
+      break;
 
-void computeRelayAndPumpState()
-{
-  if (moisture1_value < 30) {
-    relay1_state_flag = 1;
-  } else if (moisture1_value > 55) {
-    relay1_state_flag = 0;
-  }
+    case PROG_DURATION:
+      prog.duration = constrain(prog.duration + change, 1, 600);
+      break;
 
-  if (moisture2_value < 30) {
-    relay2_state_flag = 1;
-  } else if (moisture2_value > 55) {
-    relay2_state_flag = 0;
-  }
-
-  if (moisture3_value < 30) {
-    relay3_state_flag = 1;
-  } else if (moisture3_value > 55) {
-    relay3_state_flag = 0;
-  }
-
-  if (moisture4_value < 30) {
-    relay4_state_flag = 1;
-  } else if (moisture4_value > 55) {
-    relay4_state_flag = 0;
-  }
-
-  pump_state_flag = relay1_state_flag || relay2_state_flag || relay3_state_flag || relay4_state_flag;
-}
-
-void flushRelayAndPumpState() {
-  if (!pump_state_flag) {
-    digitalWrite(pump, pump_state_flag);
-    delay(10);
-  }
-
-  digitalWrite(relay1, relay1_state_flag);
-  digitalWrite(relay2, relay2_state_flag);
-  digitalWrite(relay3, relay3_state_flag);
-  digitalWrite(relay4, relay4_state_flag);
-
-  if (pump_state_flag) {
-    delay(10);
-    digitalWrite(pump, pump_state_flag);
-    pumpOnLastDateTime = RTC.now();
+    case PROG_CHANNELS:
+      channelBits = (channelBits + change + 16) % 16;
+      for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
+        prog.channels[i] = (channelBits & (1 << i)) != 0;
+      }
+      break;
   }
 }
 
-void draw_elecrow() {
-  u8g.setFont(u8g_font_gdr9r);
-  u8g.drawStr(8, 55 , "www.elecrow.com");
-  u8g.drawXBMP(0, 5, 128, 32, bitmap_logo);
+void updateClockValue(int change) {
+  DateTime now = RTC.now();
+  int year = now.year();
+  int month = now.month();
+  int day = now.day();
+  int hour = now.hour();
+  int minute = now.minute();
+  int second = now.second();
+
+  switch (state.field) {
+    case CLOCK_YEAR:
+      year = constrain(year + change, 2000, 2099);
+      break;
+    case CLOCK_MONTH:
+      month = constrain(month + change, 1, 12);
+      break;
+    case CLOCK_DAY:
+      day = constrain(day + change, 1, 31);
+      break;
+    case CLOCK_HOUR:
+      hour = (hour + change + 24) % 24;
+      break;
+    case CLOCK_MIN:
+      minute = (minute + change + 60) % 60;
+      break;
+    case CLOCK_SEC:
+      second = (second + change + 60) % 60;
+      break;
+  }
+
+  RTC.adjust(DateTime(year, month, day, hour, minute, second));
 }
 
+// Date and time formatting patterns and helpers
+struct TimeFormat {
+  // Pattern declarations
+  static const char DATE_PATTERN[];
+  static const char TIME_PATTERN[];
+  static const char TIME_SEC_PATTERN[];
+  static const char DATETIME_PATTERN[];
+  static const char PROGRAM_TIME_PATTERN[];
+  static const char DURATION_PATTERN[];
+  static const char LAST_WATERING_PATTERN[];
+  static const char NEXT_PATTERN[];
+  static const char SET_TIME_PATTERN[];
+  static const char YEAR_PATTERN[];
+  static const char MONTH_DAY_PATTERN[];
 
-void draw_time(DateTime now)
-{
-  int x = 12;
+  // Helper functions
+  static void formatDateTime(char* buffer, const DateTime& dt) {
+    sprintf_P(buffer, DATETIME_PATTERN,
+              dt.day(), dt.month(), dt.year() % 100,
+              daysOfTheWeek[dt.dayOfTheWeek()],
+              dt.hour(), dt.minute());
+  }
 
-  if (! RTC.isrunning()) {
-    u8g.setFont(u8g_font_6x10);
-    u8g.setPrintPos(5, 20);
-    u8g.print("RTC is NOT running!");
-    RTC.adjust(DateTime(__DATE__, __TIME__));
-  } else {
-    u8g.setFont(u8g_font_7x13);
-    u8g.setPrintPos(x, 11);
-    u8g.print(now.year(), DEC);
-    u8g.setPrintPos(x + 80, 11);
-    u8g.print(daysOfTheWeek[now.dayOfTheWeek()]);
-    u8g.setPrintPos(x + 28, 11);
+  static void formatTime(char* buffer, uint8_t hour, uint8_t minute) {
+    sprintf_P(buffer, TIME_PATTERN, hour, minute);
+  }
 
-    u8g.print("/");
+  static void formatProgramTime(char* buffer, uint8_t number, uint8_t hour, uint8_t minute) {
+    sprintf_P(buffer, PROGRAM_TIME_PATTERN, number, hour, minute);
+  }
+};
 
-    u8g.setPrintPos(x + 33, 11);
-    if (now.month() < 10) {
-      u8g.print(0, DEC);
-      u8g.setPrintPos(x + 40, 11);
+// Pattern definitions
+const char TimeFormat::DATE_PATTERN[] PROGMEM = "%02d.%02d.%02d";    // DD.MM.YY
+const char TimeFormat::TIME_PATTERN[] PROGMEM = "%02d:%02d";         // HH:MM
+const char TimeFormat::TIME_SEC_PATTERN[] PROGMEM = "%02d:%02d:%02d"; // HH:MM:SS
+const char TimeFormat::DATETIME_PATTERN[] PROGMEM = "%02d.%02d.%02d %s %02d:%02d"; // DD.MM.YY DDD HH:MM
+const char TimeFormat::PROGRAM_TIME_PATTERN[] PROGMEM = "P%d %02d:%02d";
+const char TimeFormat::DURATION_PATTERN[] PROGMEM = "%ds   [";
+const char TimeFormat::LAST_WATERING_PATTERN[] PROGMEM = "LAST: %02d:%02d %ds";
+const char TimeFormat::NEXT_PATTERN[] PROGMEM = "NEXT: ";
+const char TimeFormat::SET_TIME_PATTERN[] PROGMEM = "SET TIME:";
+const char TimeFormat::YEAR_PATTERN[] PROGMEM = "%04d";
+const char TimeFormat::MONTH_DAY_PATTERN[] PROGMEM = "%02d";
+
+void drawHomeScreen() {
+  DateTime now = RTC.now();
+  uint8_t nextProg;
+  DateTime next = getNextWateringTime(&nextProg);
+  char buffer[20];
+
+  // Top line: Current date and time
+  TimeFormat::formatDateTime(buffer, now);
+  u8g.drawStr(0, 8, buffer);
+  u8g.drawHLine(0, 11, 128);
+
+  // Second line: Current watering status or next program
+  if (pumpState) {
+    // Show currently running program
+    Program& runningProg = programs[state.currentProgram];
+    sprintf(buffer, "RUN: P%d %02d:00 [", state.currentProgram + 1, runningProg.hour);
+    u8g.drawStr(0, 22, buffer);
+
+    // Show active channels
+    uint8_t xPos = 96;
+    for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
+      if (runningProg.channels[i]) {
+        sprintf(buffer, "%d", i + 1);
+        u8g.drawStr(xPos, 22, buffer);
+        xPos += 7;
+      }
     }
-    u8g.print(now.month(), DEC);
+    u8g.drawStr(xPos, 22, "]");
+  } else if (next.unixtime() > now.unixtime()) {
+    // Show next scheduled program
+    Program& nextProgram = programs[nextProg];
+    strcpy_P(buffer, TimeFormat::NEXT_PATTERN);
+    u8g.drawStr(0, 22, buffer);
 
-    u8g.setPrintPos(x + 47, 11);
-    u8g.print("/");
+    sprintf(buffer, "P%d %02d:00", nextProg + 1, nextProgram.hour);
+    u8g.drawStr(30, 22, buffer);
 
-    u8g.setPrintPos(x + 53, 11);
-    if (now.day() < 10) {
-      u8g.print(0, DEC);
-      u8g.setPrintPos(x + 60, 11);
+    sprintf(buffer, "[");
+    u8g.drawStr(90, 22, buffer);
+
+    uint8_t xPos = 96;
+    for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
+      if (nextProgram.channels[i]) {
+        sprintf(buffer, "%d", i + 1);
+        u8g.drawStr(xPos, 22, buffer);
+        xPos += 7;
+      }
     }
-    u8g.print(now.day(), DEC);
+    u8g.drawStr(xPos, 22, "]");
+  } else {
+    u8g.drawStr(0, 22, "No programs active");
+  }
 
-    u8g.setFont(u8g_font_8x13);
-    int x = 35;
-    u8g.setPrintPos(x, 33);
-    if (now.hour() < 10) {
-      u8g.print(0, DEC);
-      u8g.setPrintPos(x + 7, 33);
+  // Bottom line: Active programs count
+  uint8_t activeCount = 0;
+  for (uint8_t i = 0; i < MAX_PROGRAMS; i++) {
+    if (programs[i].active) activeCount++;
+  }
+  sprintf(buffer, "Active: %d/%d", activeCount, MAX_PROGRAMS);
+  u8g.drawStr(0, 36, buffer);
+}
+
+void drawConfigScreen() {
+  char buffer[20];
+  Program& prog = programs[state.currentProgram];
+  u8g.setFont(u8g_font_6x10);
+
+  // Top line: Program number and active state
+  sprintf(buffer, "P%d", state.currentProgram + 1);
+  u8g.drawStr(0, 10, buffer);
+  sprintf(buffer, "%s", prog.active ? "ON" : "OFF");
+  u8g.drawStr(20, 10, buffer);
+
+  // Start time on same line
+  sprintf(buffer, "Start: %02d:%02d", prog.hour, prog.minute);
+  u8g.drawStr(50, 10, buffer);
+
+  // Middle line: Days of week
+  const char* days = "M T W T F S S";
+  u8g.drawStr(0, 25, days);
+
+  if (state.field == PROG_DAYS) {
+    // Show pattern name
+    u8g.setColorIndex(1);
+    u8g.drawBox(90, 17, 35, 12);
+    u8g.setColorIndex(0);
+    u8g.drawStr(92, 26, dayPatternName);
+    u8g.setColorIndex(1);
+
+    // Show current pattern selection
+    for (uint8_t i = 0; i < 7; i++) {
+      if (pgm_read_byte(&(PATTERNS[currentPattern].days[i]))) {
+        u8g.drawBox(i * 12, 26, 6, 1);
+      }
     }
-    u8g.print(now.hour(), DEC);
-
-    u8g.setPrintPos(x + 15, 33);
-    u8g.print(":");
-
-    u8g.setPrintPos(x + 21, 33);
-    if (now.minute() < 10) {
-      u8g.print(0, DEC);
-      u8g.setPrintPos(x + 28, 33);
+  } else {
+    // Show saved pattern
+    for (uint8_t i = 0; i < 7; i++) {
+      if (prog.days[i]) {
+        u8g.drawBox(i * 12, 27, 6, 1);
+      }
     }
-    u8g.print(now.minute(), DEC);
+  }
 
-    u8g.setPrintPos(x + 36, 33);
-    u8g.print(":");
+  // Bottom line: Duration and channels
+  sprintf_P(buffer, TimeFormat::DURATION_PATTERN, prog.duration);
+  u8g.drawStr(0, 40, buffer);
 
-    u8g.setPrintPos(x + 42, 33);
-    if (now.second() < 10) {
-      u8g.print(0, DEC);
-      u8g.setPrintPos(x + 49, 33);
+  uint8_t xPos = 45;
+  for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
+    sprintf(buffer, "%d", i + 1);
+    u8g.drawStr(xPos, 40, buffer);
+    if (prog.channels[i]) {
+      if (state.field == PROG_CHANNELS) {
+        u8g.drawBox(xPos, 41, 6, 1);
+      } else {
+        u8g.drawBox(xPos, 42, 6, 1);
+      }
     }
-    u8g.print(now.second(), DEC);
+    xPos += 8;
+  }
+  u8g.drawStr(xPos, 40, "]");
+
+  //drawFieldHighlight();
+  const char* fieldNames[] = {"PROGRAM", "ON/OFF", "START", "DAYS", "DURATION", "CHANNELS"};
+  u8g.drawStr(0, 63, fieldNames[state.field]);
+}
+
+
+void drawClockScreen() {
+  DateTime now = RTC.now();
+  char buffer[20];
+  u8g.setFont(u8g_font_6x10);
+
+  strcpy_P(buffer, TimeFormat::SET_TIME_PATTERN);
+  u8g.drawStr(0, 10, buffer);
+
+  // Year (4 digits = 24px + 6px spacing)
+  if (state.field == CLOCK_YEAR) {
+    u8g.setColorIndex(1);
+    u8g.drawBox(0, 15, 26, 12);
+    u8g.setColorIndex(0);
+    sprintf_P(buffer, TimeFormat::YEAR_PATTERN, now.year());
+    u8g.drawStr(2, 25, buffer);
+    u8g.setColorIndex(1);
+  } else {
+    sprintf_P(buffer, TimeFormat::YEAR_PATTERN, now.year());
+    u8g.drawStr(0, 25, buffer);
+  }
+
+  u8g.drawStr(30, 25, ".");
+
+  // Month (2 digits = 12px + 6px spacing)
+  if (state.field == CLOCK_MONTH) {
+    u8g.setColorIndex(1);
+    u8g.drawBox(38, 15, 14, 12);
+    u8g.setColorIndex(0);
+    sprintf_P(buffer, TimeFormat::MONTH_DAY_PATTERN, now.month());
+    u8g.drawStr(40, 25, buffer);
+    u8g.setColorIndex(1);
+  } else {
+    sprintf_P(buffer, TimeFormat::MONTH_DAY_PATTERN, now.month());
+    u8g.drawStr(38, 25, buffer);
+  }
+
+  u8g.drawStr(56, 25, ".");
+
+  // Day (2 digits = 12px)
+  if (state.field == CLOCK_DAY) {
+    u8g.setColorIndex(1);
+    u8g.drawBox(64, 15, 14, 12);
+    u8g.setColorIndex(0);
+    sprintf_P(buffer, TimeFormat::MONTH_DAY_PATTERN, now.day());
+    u8g.drawStr(66, 25, buffer);
+    u8g.setColorIndex(1);
+  } else {
+    sprintf_P(buffer, TimeFormat::MONTH_DAY_PATTERN, now.day());
+    u8g.drawStr(64, 25, buffer);
+  }
+
+  drawTimeFields(now);
+}
+
+void drawTimeFields(const DateTime& now) {
+  char buffer[10];
+
+  // Hour (2 digits = 12px + 6px spacing)
+  if (state.field == CLOCK_HOUR) {
+    u8g.setColorIndex(1);
+    u8g.drawBox(0, 30, 14, 12);
+    u8g.setColorIndex(0);
+    sprintf_P(buffer, TimeFormat::MONTH_DAY_PATTERN, now.hour());
+    u8g.drawStr(2, 40, buffer);
+    u8g.setColorIndex(1);
+  } else {
+    sprintf_P(buffer, TimeFormat::MONTH_DAY_PATTERN, now.hour());
+    u8g.drawStr(0, 40, buffer);
+  }
+
+  u8g.drawStr(18, 40, ":");
+
+  // Minutes (2 digits = 12px + 6px spacing)
+  if (state.field == CLOCK_MIN) {
+    u8g.setColorIndex(1);
+    u8g.drawBox(26, 30, 14, 12);
+    u8g.setColorIndex(0);
+    sprintf_P(buffer, TimeFormat::MONTH_DAY_PATTERN, now.minute());
+    u8g.drawStr(28, 40, buffer);
+    u8g.setColorIndex(1);
+  } else {
+    sprintf_P(buffer, TimeFormat::MONTH_DAY_PATTERN, now.minute());
+    u8g.drawStr(26, 40, buffer);
+  }
+
+  u8g.drawStr(44, 40, ":");  // More space before delimiter
+
+  // Seconds (2 digits = 12px)
+  if (state.field == CLOCK_SEC) {
+    u8g.setColorIndex(1);
+    u8g.drawBox(52, 30, 14, 12);  // Increased box width
+    u8g.setColorIndex(0);
+    sprintf_P(buffer, TimeFormat::MONTH_DAY_PATTERN, now.second());
+    u8g.drawStr(54, 40, buffer);
+    u8g.setColorIndex(1);
+  } else {
+    sprintf_P(buffer, TimeFormat::MONTH_DAY_PATTERN, now.second());
+    u8g.drawStr(52, 40, buffer);
   }
 }
 
-void drawLogo(uint8_t d)
-{
-  u8g.setFont(u8g_font_gdr25r);
-  u8g.drawStr(8 + d, 30 + d, "E");
-  u8g.setFont(u8g_font_gdr25r);
-  u8g.drawStr(30 + d, 30 + d, "l");
-  u8g.setFont(u8g_font_gdr25r);
-  u8g.drawStr(40 + d, 30 + d, "e");
-  u8g.setFont(u8g_font_gdr25r);
-  u8g.drawStr(55 + d, 30 + d, "c");
-  u8g.setFont(u8g_font_gdr25r);
-  u8g.drawStr(70 + d, 30 + d, "r");
-  u8g.setFont(u8g_font_gdr25r);
-  u8g.drawStr(85 + d, 30 + d, "o");
-  u8g.setFont(u8g_font_gdr25r);
-  u8g.drawStr(100 + d, 30 + d, "w");
-}
 
+void drawFieldHighlight() {
+  if (state.screen == 1) { // Config screen
+    Program& prog = programs[state.currentProgram];
 
-//Style the flowers     bitmap_bad: bad flowers     bitmap_good:good  flowers
-void drawflower()
-{
-  if (moisture1_value < 30) {
-    u8g.drawXBMP(0, 0, 32, 30, bitmap_bad);
-  } else {
-    u8g.drawXBMP(0, 0, 32, 30, bitmap_good);
-  }
+    switch (state.field) {
+      case PROG_NUMBER:
+        // Just draw two dots under the program number
+        u8g.setColorIndex(1);
+        u8g.drawBox(0, 1, 14, 10);
+        u8g.setColorIndex(0);
+        char buffer[3];
+        sprintf(buffer, "P%d", state.currentProgram + 1);
+        u8g.drawStr(1, 10, buffer);
+        u8g.setColorIndex(1);
+        break;
 
-  if (moisture2_value < 30) {
-    u8g.drawXBMP(32, 0, 32, 30, bitmap_bad);
-  } else {
-    u8g.drawXBMP(32, 0, 32, 30, bitmap_good);
-  }
+      case PROG_START:
+        // Two dots under the time
+        u8g.drawPixel(20, 12);
+        u8g.drawPixel(22, 12);
+        break;
 
-  if (moisture3_value < 30) {
-    u8g.drawXBMP(64, 0, 32, 30, bitmap_bad);
-  } else {
-    u8g.drawXBMP(64, 0, 32, 30, bitmap_good);
-  }
+      case PROG_DAYS:
+        // No additional highlight needed here as we show pattern name
+        // and dots above days in drawConfigScreen
+        break;
 
-  if (moisture4_value < 30) {
-    u8g.drawXBMP(96, 0, 32, 30, bitmap_bad);
-  } else {
-    u8g.drawXBMP(96, 0, 32, 30, bitmap_good);
+      case PROG_DURATION:
+        // Two dots under duration
+        u8g.drawPixel(10, 42);
+        u8g.drawPixel(12, 42);
+        break;
+
+      case PROG_CHANNELS:
+        // Selection handled in drawConfigScreen
+        break;
+    }
   }
 }
 
 
-void drawTH()
-{
-  int A = 0;
-  int B = 0;
-  int C = 64;
-  int D = 96;
-  char moisture1_value_temp[5] = {0};
-  char moisture2_value_temp[5] = {0};
-  char moisture3_value_temp[5] = {0};
-  char moisture4_value_temp[5] = {0};
+DateTime getNextWateringTime(uint8_t* nextProgram) {
+  DateTime now = RTC.now();
+  DateTime next = now;
+  bool foundNext = false;
+  *nextProgram = 0;
 
-  itoa(moisture1_value, moisture1_value_temp, 10);
-  itoa(moisture2_value, moisture2_value_temp, 10);
-  itoa(moisture3_value, moisture3_value_temp, 10);
-  itoa(moisture4_value, moisture4_value_temp, 10);
-  u8g.setFont(u8g_font_7x14);
-  u8g.setPrintPos(9, 60);
-  u8g.print("A0");
+  // Check each program
+  for (uint8_t p = 0; p < MAX_PROGRAMS; p++) {
+    if (!programs[p].active) continue;
 
-  if (moisture1_value < 10) {
-    u8g.drawStr(A + 14, 45, moisture1_value_temp);
-  } else if (moisture1_value < 100) {
-    u8g.drawStr(A + 7, 45, moisture1_value_temp);
-  } else {
-    moisture1_value = 100;
-    u8g.drawStr(A + 2, 45, moisture1_value_temp);
+    // Look ahead up to 7 days
+    for (uint8_t daysAhead = 0; daysAhead < 7; daysAhead++) {
+      uint8_t checkDay = (now.dayOfTheWeek() + daysAhead) % 7;
+
+      if (programs[p].days[checkDay]) {
+        DateTime checkTime = now + TimeSpan(daysAhead, 0, 0, 0);
+        DateTime programTime = DateTime(
+                                 checkTime.year(),
+                                 checkTime.month(),
+                                 checkTime.day(),
+                                 programs[p].hour,
+                                 programs[p].minute,
+                                 0
+                               );
+
+        if (programTime.unixtime() > now.unixtime() &&
+            (!foundNext || programTime.unixtime() < next.unixtime())) {
+          next = programTime;
+          *nextProgram = p;
+          foundNext = true;
+        }
+      }
+    }
   }
-  u8g.setPrintPos(A + 23, 45 );
-  u8g.print("%");
 
-  u8g.setPrintPos(41, 60 );
-  u8g.print("A1");
-  if (moisture2_value < 10) {
-    u8g.drawStr(B + 46, 45, moisture2_value_temp);
-  } else if (moisture2_value < 100) {
-    u8g.drawStr(B + 39, 45, moisture2_value_temp);
-  } else {
-    moisture2_value = 100;
-    u8g.drawStr(B + 32, 45, moisture2_value_temp);
-  }
-  u8g.setPrintPos(B + 54, 45);
-  u8g.print("%");
+  return foundNext ? next : now;
+}
 
-  u8g.setPrintPos(73, 60);
-  u8g.print("A2");
-  if (moisture3_value < 10) {
-    u8g.drawStr(C + 14, 45, moisture3_value_temp);
-  } else if (moisture3_value < 100) {
-    u8g.drawStr(C + 7, 45, moisture3_value_temp);
-  } else {
-    moisture3_value = 100;
-    u8g.drawStr(C + 2, 45, moisture3_value_temp);
-  }
-  u8g.setPrintPos(C + 23, 45);
-  u8g.print("%");
+void updateWateringSystem() {
+  DateTime now = RTC.now();
+  static DateTime lastCheck = now;
+  static unsigned long wateringStartTime = 0;
 
-  u8g.setPrintPos(105, 60);
-  u8g.print("A3");
-  if (moisture4_value < 10) {
-    //u8g.setPrintPos(D + 14, 45 );
-    u8g.drawStr(D + 14, 45, moisture4_value_temp);
-  } else if (moisture4_value < 100) {
-    // u8g.setPrintPos(D + 7, 45);
-    u8g.drawStr(D + 7, 45, moisture4_value_temp);
-  } else {
-    //u8g.setPrintPos(D + 2, 45);
-    moisture4_value = 100;
-    u8g.drawStr(D + 2, 45, moisture4_value_temp);
+  // Check for new watering starts every minute
+  if ((now.unixtime() - lastCheck.unixtime()) >= 60) {
+    lastCheck = now;
+
+    // Only check for new starts if not currently watering
+    if (!pumpState) {
+      for (uint8_t i = 0; i < MAX_PROGRAMS; i++) {
+        Program& prog = programs[i];
+        if (!prog.active) continue;
+
+        // Check if this program should start
+        if (prog.days[now.dayOfTheWeek()] &&
+            now.hour() == prog.hour && now.minute() == prog.minute) {
+          state.currentProgram = i;  // Use existing state variable
+          startWatering();
+          wateringStartTime = millis();
+          break;
+        }
+      }
+    }
   }
-  //u8g.print(moisture4_value);
-  u8g.setPrintPos(D + 23, 45);
-  u8g.print("%");
+
+  // Check for watering stop every loop cycle (for precise timing)
+  if (pumpState) {
+    unsigned long elapsedSeconds = (millis() - wateringStartTime) / 1000;
+    if (elapsedSeconds >= programs[state.currentProgram].duration) {
+      stopWatering();
+    }
+  }
+}
+
+void startWatering() {
+  // First activate selected channels from current program
+  Program& prog = programs[state.currentProgram];
+
+  for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
+    if (prog.channels[i]) {
+      digitalWrite(CHANNEL_PINS[i], HIGH);
+      channelStates[i] = true;
+    }
+  }
+
+  digitalWrite(PUMP_PIN, HIGH);
+  pumpState = true;
+  Serial.println("Watering started");
+}
+
+void stopWatering() {
+  // First stop pump
+  digitalWrite(PUMP_PIN, LOW);
+  pumpState = false;
+
+  // Then close all channels
+  for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
+    digitalWrite(CHANNEL_PINS[i], LOW);
+    channelStates[i] = false;
+  }
+
+  Serial.println("Watering stopped");
+}
+
+// Debug functions
+void testEncoder() {
+  static int lastValue = encoderValue;
+  static bool lastButton = buttonState;
+
+  if (encoderValue != lastValue || buttonState != lastButton) {
+    Serial.print("Encoder: ");
+    Serial.print(encoderValue);
+    Serial.print(" Button: ");
+    Serial.println(buttonState ? "UP" : "DOWN");
+    lastValue = encoderValue;
+    lastButton = buttonState;
+  }
+}
+
+void testScreenTransitions() {
+  static uint8_t lastScreen = state.screen;
+  static uint8_t lastField = state.field;
+
+  if (lastScreen != state.screen || lastField != state.field) {
+    Serial.print("Screen: ");
+    Serial.print(state.screen);
+    Serial.print(" Field: ");
+    Serial.println(state.field);
+    lastScreen = state.screen;
+    lastField = state.field;
+  }
+}
+
+
+struct EEPROMData {
+  uint16_t magic;
+  Program programs[MAX_PROGRAMS];
+};
+
+void savePrograms() {
+  EEPROMData data;
+  data.magic = EEPROM_MAGIC;
+
+  // Copy current programs
+  for (uint8_t i = 0; i < MAX_PROGRAMS; i++) {
+    data.programs[i] = programs[i];
+  }
+
+  // Write to EEPROM
+  EEPROM.put(EEPROM_START_ADDR, data);
+
+  Serial.println("Programs saved to EEPROM");
+}
+
+bool loadPrograms() {
+  EEPROMData data;
+
+  // Read from EEPROM
+  EEPROM.get(EEPROM_START_ADDR, data);
+
+  // Check magic number
+  if (data.magic == EEPROM_MAGIC) {
+    // Copy programs from EEPROM
+    for (uint8_t i = 0; i < MAX_PROGRAMS; i++) {
+      programs[i] = data.programs[i];
+    }
+    Serial.println("Programs loaded from EEPROM");
+    return true;
+  } else {
+    Serial.println("No valid EEPROM data found");
+    return false;
+  }
+}
+
+void initializeDefaultPrograms() {
+  for (uint8_t i = 0; i < MAX_PROGRAMS; i++) {
+    programs[i] = {
+      .number = i + 1,
+      .hour = 12,
+      .minute = 0,
+      .duration = 30,
+      .days = {0},
+      .channels = {0},
+      .active = false
+    };
+  }
 }
